@@ -19,6 +19,7 @@ from tf_transformations import quaternion_from_euler as tquat
 from tf_transformations import euler_from_quaternion as teul
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 from visualization_msgs.msg import Marker, MarkerArray
 from . import transformations as trans
 
@@ -35,13 +36,23 @@ class TurtlebotExplore(Node):
 
         qos_policy = QoSProfile(durability=QoSDurabilityPolicy.VOLATILE, reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST, depth=1)
         
+        self.tf_buffer = Buffer()
+        self.transform_listener = TransformListener(self.tf_buffer, self)
+        
+        # If our computer is slow, we must not assume that previous nodes have completed
+        # their setup before we get to this point. hence we should wait until there is 
+        # a transform available to us before moving on. In the mean time, we spin once
+        # to allow background callbacks to function along with our transform listener
+        self.get_logger().info("Waiting for initial transform to be available...")
+        while not self.tf_buffer.can_transform(BASE_FRAME, 'odom', rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)):
+            rclpy.spin_once(self, timeout_sec=0.1)
+        
         self.pub_stack_points = self.create_publisher(MarkerArray, '/stack_points', 5)
         self.startSub = self.create_subscription(String, '/start_explore', self.start_callback, 5)
         self.laserSub = self.create_subscription(LaserScan, '/scan', self.lidar_callback, qos_policy)
         self.odomSub = self.create_subscription(Odometry, '/odom', self.odom_callback, 5)
         self.move_action = ActionClient(self, NavigateToPose, '/navigate_to_pose')
-        self.tf_buffer = Buffer()
-        self.transform_listener = TransformListener(self.tf_buffer, self)
+
         self.goal = None
         self.startSub
         self.laserSub
@@ -84,7 +95,11 @@ class TurtlebotExplore(Node):
 
                 if not self.goal_stack:
                     if self.start:
-                        self.set_goal(2, [0,180])
+                        # There was a bug here. An additional argument was included
+                        # despite set_goal only taking 1. From reading the code I
+                        # inferred the intended functionality and fixed it.
+                        # Before the fix this was causing occasional crashes
+                        self.set_goal([0,180])
                     else:
                         self.get_logger().info('Exploration Completed')
                         self.pub_stack_points.publish(self.stack_points)
@@ -298,12 +313,30 @@ class TurtlebotExplore(Node):
 
     def get_transform(self, data):
         try:
-            new_transform = self.tf_buffer.lookup_transform(BASE_FRAME, data.header.frame_id, data.header.stamp)
+            # This is another refactor that was particularly
+            # challenging to fix. Basically we were demanding transforms
+            # which corresponded to exact timestamps taken from lidar results
+            # However, if nodes did not correctly synchronise in time during
+            # startup (Slow PC issue again), it meant we were asking for transforms
+            # at times that did not have any. As far as I could tell from reading the
+            # code, it did not seem strictly important that we needed this level
+            # of time sync. Instead, we can just request the most recent transform.
+            # This improved reliability considerably on lower VM core counts
+            new_transform = self.tf_buffer.lookup_transform(
+                BASE_FRAME,
+                data.header.frame_id,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5)
+            )
             position = new_transform.transform.translation
             quaternion = new_transform.transform.rotation
             return trans.pq_to_se3(position, quaternion)
-        except Exception as e:
-            self.get_logger.info()('Unable to get transformation! %r' % (e))   
+            
+        # Good code practice: we catch specific errors we expect may occur and handle them
+        # gracefully rather than crashing. However, we still crash if an unexpected exception
+        # occurs. This prevents us from entering an irrecoverable state.
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().info(f'Unable to get transformation: {e}') #Fixed Syntax Error on this line
             return []
 
         
